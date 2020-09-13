@@ -8,15 +8,16 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Threading;
+using System.Windows.Interop;
 using EnvDTE80;
 using Microsoft.VisualStudio.ComponentModelHost;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Threading;
-using Windows.Foundation;
 using Windows.Storage;
 using Windows.Storage.Streams;
 using Windows.UI.Input;
+using DialControllerTools.Helpers;
+
 using Task = System.Threading.Tasks.Task;
 
 namespace DialControllerTools
@@ -24,6 +25,8 @@ namespace DialControllerTools
     internal class DialControllerHost : IDialControllerHost
     {
         private static readonly Dictionary<EnvDTE.Window, RadialController> controllersMapping = new Dictionary<EnvDTE.Window, RadialController>();
+        private static readonly Dictionary<Window, RadialController> childrenControllersMapping = new Dictionary<Window, RadialController>();
+        private static readonly ShellHook _hooks = new ShellHook();
 
         private readonly DTE2 dte;
         public DTE2 DTE => dte;
@@ -66,9 +69,42 @@ namespace DialControllerTools
             var mainWindow = dte.DTE.MainWindow;
             await Task.WhenAll(
                 ThreadHelper.JoinableTaskFactory.StartOnIdle(Instance.CreateStatusBarItem).JoinAsync(),
-                ThreadHelper.JoinableTaskFactory.StartOnIdle(new Action(() => controllersMapping.Add(mainWindow, Instance.CreateController(mainWindow)))).JoinAsync());
+                ThreadHelper.JoinableTaskFactory.StartOnIdle(new Action(() => controllersMapping.Add(mainWindow, Instance.CreateController(new IntPtr(mainWindow.HWnd))))).JoinAsync());
             await optionsLoadTask;
             await Instance.ImportProvidersAsync(cancellationToken);
+
+
+            var messageCallbacks = new Dictionary<WH_SHELL_MESSAGES, Action<IntPtr>>();
+            messageCallbacks[WH_SHELL_MESSAGES.HSHELL_WINDOWCREATED] = CreateCallback;
+
+            var success = _hooks.Set(messageCallbacks);
+            //if (!success)
+            //{
+            //    Logger.Instance.Log("ERROR SET HOOK");
+            //}
+        }
+
+        private static void CreateCallback(IntPtr hwnd)
+        {
+            var hwndSource = HwndSource.FromHwnd(hwnd);
+
+            var window = hwndSource.RootVisual as Window;
+            window.Closed += Window_Closed;
+
+            childrenControllersMapping[window] = Instance.CreateController(hwnd);
+
+            Logger.Instance.Log($"CREATED: title - {window.Title}");
+        }
+
+        private static void Window_Closed(object sender, EventArgs e)
+        {
+            var window = sender as Window;
+            if (childrenControllersMapping.TryGetValue(window, out var controller))
+            {
+                Instance.UnsubscribeFromController(controller);
+                childrenControllersMapping.Remove(window);
+                Logger.Instance.Log($"CLOSED: title - {window.Title}");
+            }
         }
 
         private void CreateStatusBarItem()
@@ -78,12 +114,12 @@ namespace DialControllerTools
             injector.InjectControl(_status);
         }
 
-        internal RadialController CreateController(EnvDTE.Window window)
+        internal RadialController CreateController(IntPtr hWnd)
         {
             var interop = (IRadialControllerInterop)WindowsRuntimeMarshal.GetActivationFactory(typeof(RadialController));
             Guid guid = typeof(RadialController).GetInterface("IRadialController").GUID;
 
-            var radialController = interop.CreateForWindow(new IntPtr(window.HWnd), ref guid);
+            var radialController = interop.CreateForWindow(hWnd, ref guid);
             radialController.RotationChanged += OnRotationChanged;
             radialController.ButtonClicked += OnButtonClicked;
             radialController.ControlAcquired += OnControlAcquired;
